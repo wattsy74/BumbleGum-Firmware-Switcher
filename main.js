@@ -36,6 +36,100 @@ if (!fs.existsSync(CACHE_DIR)) {
     fs.mkdirSync(CACHE_DIR, { recursive: true });
 }
 
+const HARDWARE_VERSION_CACHE_FILE = path.join(CACHE_DIR, 'hardware-version.json');
+
+function normalizeHardwareVersion(version) {
+    return version === 'v1' || version === 'v2' ? version : null;
+}
+
+function readCachedHardwareVersion() {
+    try {
+        if (!fs.existsSync(HARDWARE_VERSION_CACHE_FILE)) {
+            return null;
+        }
+
+        const raw = fs.readFileSync(HARDWARE_VERSION_CACHE_FILE, 'utf-8');
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed.version !== 'string') {
+            return null;
+        }
+
+        return {
+            version: normalizeHardwareVersion(parsed.version),
+            source: parsed.source || 'cache',
+            updatedAt: parsed.updatedAt || null
+        };
+    } catch (error) {
+        console.warn('[VERSION] Could not read cached hardware version:', error.message);
+        return null;
+    }
+}
+
+function writeCachedHardwareVersion(version, source) {
+    const normalized = normalizeHardwareVersion(version);
+    try {
+        const payload = {
+            version: normalized,
+            source,
+            updatedAt: new Date().toISOString()
+        };
+        fs.writeFileSync(HARDWARE_VERSION_CACHE_FILE, JSON.stringify(payload, null, 2), 'utf-8');
+        console.log(`[VERSION] ✓ Cached hardware version ${normalized} (${source})`);
+    } catch (error) {
+        console.warn('[VERSION] Could not cache hardware version:', error.message);
+    }
+    return normalized;
+}
+
+function readHardwareVersionFromBootselOrCache(bootselPath) {
+    const versionFile = path.join(bootselPath, 'hardware_version.txt');
+    console.log('[VERSION] Checking for hardware_version.txt at:', versionFile);
+
+    if (fs.existsSync(versionFile)) {
+        const fileVersion = normalizeHardwareVersion(fs.readFileSync(versionFile, 'utf-8').trim());
+        writeCachedHardwareVersion(fileVersion, 'bootsel-file');
+        console.log('[VERSION] ✓ Found hardware version in BOOTSEL file:', fileVersion);
+        return { success: true, version: fileVersion, source: 'bootsel-file' };
+    }
+
+    const cached = readCachedHardwareVersion();
+    if (cached) {
+        console.log('[VERSION] ✓ Using cached hardware version:', cached.version);
+        return { success: true, version: cached.version, source: 'cache' };
+    }
+
+    console.log('[VERSION] ⚠️  No hardware_version.txt and no cache');
+    return { success: false, version: null, source: 'unknown' };
+}
+
+function parseHardwareVersionFromText(text) {
+    if (!text) {
+        return null;
+    }
+
+    const haystack = String(text).toLowerCase();
+
+    if (
+        haystack.includes('guitar v1') ||
+        haystack.includes('guitarv1') ||
+        haystack.includes('guitar-v1') ||
+        /\bv1\b/.test(haystack)
+    ) {
+        return 'v1';
+    }
+
+    if (
+        haystack.includes('guitar v2') ||
+        haystack.includes('guitarv2') ||
+        haystack.includes('guitar-v2') ||
+        /\bv2\b/.test(haystack)
+    ) {
+        return 'v2';
+    }
+
+    return null;
+}
+
 // Firmware URLs - v1 (pin 10) vs v2 (pin 13) hardware variants
 const FIRMWARE_URLS = {
     // Classic firmware variants
@@ -111,7 +205,8 @@ ipcMain.handle('list-hid-devices', async () => {
             path: d.path,
             manufacturer: d.manufacturer,
             product: d.product,
-            serialNumber: d.serialNumber
+            serialNumber: d.serialNumber,
+            inferredHardwareVersion: parseHardwareVersionFromText(d.product)
         }));
     } catch (error) {
         console.error('Error listing HID devices:', error);
@@ -453,7 +548,7 @@ ipcMain.handle('start-flash', async (event, firmware, url) => {
 
 // Watch for BOOTSEL, read hardware version, then flash appropriate firmware variant
 // Used when switching FROM Santroller firmware where we can't read config.json
-ipcMain.handle('start-flash-with-version-detection', async (event, targetFirmware) => {
+ipcMain.handle('start-flash-with-version-detection', async (event, targetFirmware, hardwareVersion) => {
     try {
         console.log(`[FLASH] Starting version-detection flash for ${targetFirmware}`);
         
@@ -484,20 +579,15 @@ ipcMain.handle('start-flash-with-version-detection', async (event, targetFirmwar
                     await new Promise(resolve => setTimeout(resolve, 1000));
                     
                     try {
-                        // Read hardware version from BOOTSEL
-                        console.log('[FLASH] Reading hardware version from BOOTSEL...');
-                        let hardwareVersion = 'v2'; // Default
-                        
-                        const versionFile = path.join(bootselPath, 'hardware_version.txt');
-                        if (fs.existsSync(versionFile)) {
-                            hardwareVersion = fs.readFileSync(versionFile, 'utf-8').trim();
-                            console.log(`[FLASH] ✓ Hardware version from flag file: ${hardwareVersion}`);
-                        } else {
-                            console.log(`[FLASH] ⚠️  No hardware_version.txt found, defaulting to v2`);
+                        const normalizedHardwareVersion = normalizeHardwareVersion(hardwareVersion);
+                        if (!normalizedHardwareVersion) {
+                            throw new Error('Cannot determine hardware version from Santroller device name. Refusing to flash to avoid wrong firmware variant.');
                         }
+
+                        console.log(`[FLASH] Hardware version selected from Santroller name: ${normalizedHardwareVersion}`);
                         
                         // Determine firmware name
-                        const firmwareName = `${targetFirmware === 'classic' ? 'Classic' : 'Santroller'}-${hardwareVersion}`;
+                        const firmwareName = `${targetFirmware === 'classic' ? 'Classic' : 'Santroller'}-${normalizedHardwareVersion}`;
                         const firmwareUrl = FIRMWARE_URLS[firmwareName];
                         
                         console.log(`[FLASH] Selected firmware: ${firmwareName}`);
@@ -973,6 +1063,8 @@ ipcMain.handle('read-classic-config', async (event, portPath) => {
                             } else {
                                 logSerial('[CONFIG] ⚠️  Unknown neopixel_pin: ' + neopixelPin + ', defaulting to v2');
                             }
+
+                            writeCachedHardwareVersion(version, 'classic-config');
                             
                             logSerial('========================================\n');
                             port.close();
@@ -1013,31 +1105,31 @@ ipcMain.handle('read-classic-config', async (event, portPath) => {
 // Read hardware version from hardware_version.txt on BOOTSEL volume
 ipcMain.handle('read-hardware-version', async (event, bootselPath) => {
     try {
-        const versionFile = path.join(bootselPath, 'hardware_version.txt');
-        console.log('[VERSION] Checking for hardware_version.txt at:', versionFile);
-        
-        if (fs.existsSync(versionFile)) {
-            const content = fs.readFileSync(versionFile, 'utf-8').trim();
-            console.log('[VERSION] ✓ Found hardware version:', content);
-            return { success: true, version: content };
-        } else {
-            console.log('[VERSION] ⚠️  No hardware_version.txt found, defaulting to v2');
-            return { success: false, version: 'v2' }; // Default to v2 for new devices
-        }
+        return readHardwareVersionFromBootselOrCache(bootselPath);
     } catch (error) {
         console.error('[VERSION] Error reading hardware_version.txt:', error.message);
         return { success: false, version: 'v2' }; // Default to v2 on error
     }
 });
 
+ipcMain.handle('read-cached-hardware-version', async () => {
+    const cached = readCachedHardwareVersion();
+    if (cached) {
+        return { success: true, version: cached.version, source: 'cache' };
+    }
+    return { success: false, version: 'v2', source: 'default' };
+});
+
 // Write hardware version to hardware_version.txt on BOOTSEL volume
 ipcMain.handle('write-hardware-version', async (event, bootselPath, version) => {
     try {
+        const normalizedVersion = normalizeHardwareVersion(version);
         const versionFile = path.join(bootselPath, 'hardware_version.txt');
-        console.log('[VERSION] Writing hardware version:', version, 'to', versionFile);
+        console.log('[VERSION] Writing hardware version:', normalizedVersion, 'to', versionFile);
         
-        fs.writeFileSync(versionFile, version + '\n', 'utf-8');
+        fs.writeFileSync(versionFile, normalizedVersion + '\n', 'utf-8');
         console.log('[VERSION] ✓ Hardware version file written successfully');
+        writeCachedHardwareVersion(normalizedVersion, 'bootsel-write');
         
         // Sync on Unix systems
         if (process.platform !== 'win32') {

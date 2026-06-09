@@ -17,11 +17,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
     
     // Hardware version detection
     readHardwareVersion: (bootselPath) => ipcRenderer.invoke('read-hardware-version', bootselPath),
+    readCachedHardwareVersion: () => ipcRenderer.invoke('read-cached-hardware-version'),
     writeHardwareVersion: (bootselPath, version) => ipcRenderer.invoke('write-hardware-version', bootselPath, version),
     
     // Flash operations
     startFlash: (firmware, url) => ipcRenderer.invoke('start-flash', firmware, url),
-    startFlashWithVersionDetection: (targetFirmware) => ipcRenderer.invoke('start-flash-with-version-detection', targetFirmware),
+    startFlashWithVersionDetection: (targetFirmware, hardwareVersion) => ipcRenderer.invoke('start-flash-with-version-detection', targetFirmware, hardwareVersion),
     flashToBootsel: (firmware, url, bootselPath) => ipcRenderer.invoke('flash-to-bootsel', firmware, url, bootselPath),
     
     // Progress updates

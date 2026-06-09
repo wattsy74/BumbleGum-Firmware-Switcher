@@ -6,7 +6,8 @@ const FIRMWARE_URLS = {
 };
 
 let currentDevice = null;
-let hardwareVersion = 'v2'; // Default to v2 (latest hardware)
+let hardwareVersion = 'unknown';
+let lastKnownHardwareVersion = 'unknown';
 
 const statusDot = document.getElementById('statusDot');
 const deviceName = document.getElementById('deviceName');
@@ -36,16 +37,19 @@ async function detectDevice() {
             const versionResult = await window.electronAPI.readHardwareVersion(bootsel.path);
             if (versionResult.success) {
                 hardwareVersion = versionResult.version;
+                lastKnownHardwareVersion = hardwareVersion;
                 console.log('[DETECT] ✓ Hardware version from flag file:', hardwareVersion);
             } else {
-                hardwareVersion = 'v2'; // Default for new devices
-                console.log('[DETECT] No hardware_version.txt, defaulting to v2');
+                hardwareVersion = 'unknown';
+                console.log('[DETECT] No reliable hardware version source found for BOOTSEL');
             }
             
             currentDevice = { type: 'bootsel', path: bootsel.path, name: 'RP2040 Bootloader' };
             deviceName.textContent = 'RP2040 Bootloader';
             currentFW.textContent = 'No firmware - Ready to flash';
-            hwVersion.textContent = `Hardware: ${hardwareVersion.toUpperCase()}`;
+            hwVersion.textContent = hardwareVersion === 'unknown'
+                ? 'Hardware: UNKNOWN (safe mode)'
+                : `Hardware: ${hardwareVersion.toUpperCase()}`;
             statusDot.className = 'status-dot connected';
             updateButtons('bootsel');
             return;
@@ -57,13 +61,18 @@ async function detectDevice() {
         if (hid.length > 0) {
             console.log('[DETECT] ✓ Santroller found:', hid[0]);
             
-            // For Santroller, we need to wait until we can read CIRCUITPY during reboot
-            // For now, use stored version or default to v2
+            hardwareVersion = hid[0].inferredHardwareVersion || 'unknown';
+            if (hardwareVersion === 'v1' || hardwareVersion === 'v2') {
+                lastKnownHardwareVersion = hardwareVersion;
+            }
+            console.log('[DETECT] ✓ Hardware version from Santroller name:', hardwareVersion);
             
             currentDevice = { type: 'santroller', path: hid[0].path, name: hid[0].product || 'Santroller' };
             deviceName.textContent = currentDevice.name;
             currentFW.textContent = 'Santroller firmware';
-            hwVersion.textContent = `Hardware: ${hardwareVersion.toUpperCase()}`;
+            hwVersion.textContent = hardwareVersion === 'unknown'
+                ? 'Hardware: UNKNOWN (safe mode)'
+                : `Hardware: ${hardwareVersion.toUpperCase()}`;
             statusDot.className = 'status-dot connected';
             updateButtons('santroller');
             return;
@@ -119,6 +128,7 @@ async function detectDevice() {
                 const configResult = await window.electronAPI.readClassicConfig(classic.path);
                 if (configResult.success) {
                     hardwareVersion = configResult.version;
+                    lastKnownHardwareVersion = hardwareVersion;
                     console.log('[DETECT] ✓ Hardware version from config.json:', hardwareVersion);
                 }
             } catch (e) {
@@ -136,7 +146,7 @@ async function detectDevice() {
 
         // No device
         currentDevice = null;
-        hardwareVersion = 'v2'; // Reset to default
+        hardwareVersion = 'unknown';
         deviceName.textContent = 'No device';
         currentFW.textContent = 'Plug in your device';
         hwVersion.textContent = '';
@@ -189,14 +199,24 @@ async function flashFirmware(targetFirmware) {
     updateProgress(10, 'Starting...');
 
     try {
+        const versionForFlash = (hardwareVersion === 'v1' || hardwareVersion === 'v2')
+            ? hardwareVersion
+            : (lastKnownHardwareVersion === 'v1' || lastKnownHardwareVersion === 'v2')
+                ? lastKnownHardwareVersion
+                : 'unknown';
+
         // Direct flash if BOOTSEL
         if (currentDevice.type === 'bootsel') {
+            if (versionForFlash !== 'v1' && versionForFlash !== 'v2') {
+                throw new Error('Cannot determine hardware version from device. Flash blocked to avoid applying wrong firmware variant.');
+            }
+
             // Determine firmware name based on target and hardware version
-            const firmwareName = `${targetFirmware === 'classic' ? 'Classic' : 'Santroller'}-${hardwareVersion}`;
+            const firmwareName = `${targetFirmware === 'classic' ? 'Classic' : 'Santroller'}-${versionForFlash}`;
             const firmwareUrl = FIRMWARE_URLS[firmwareName];
             
             console.log('[FLASH] Target firmware:', targetFirmware);
-            console.log('[FLASH] Hardware version:', hardwareVersion);
+            console.log('[FLASH] Hardware version:', versionForFlash);
             console.log('[FLASH] Firmware name:', firmwareName);
             console.log('[FLASH] Firmware URL:', firmwareUrl);
             
@@ -204,7 +224,7 @@ async function flashFirmware(targetFirmware) {
             
             // Write hardware_version.txt to persist across firmware changes
             try {
-                await window.electronAPI.writeHardwareVersion(currentDevice.path, hardwareVersion);
+                await window.electronAPI.writeHardwareVersion(currentDevice.path, versionForFlash);
                 console.log('[FLASH] ✓ Hardware version flag written');
             } catch (e) {
                 console.warn('[FLASH] Could not write hardware version flag:', e.message);
@@ -230,6 +250,7 @@ async function flashFirmware(targetFirmware) {
                 const configResult = await window.electronAPI.readClassicConfig(currentDevice.path);
                 if (configResult.success) {
                     hardwareVersion = configResult.version;
+                    lastKnownHardwareVersion = hardwareVersion;
                     console.log('[FLASH] ✓ Hardware version confirmed:', hardwareVersion);
                 }
             } catch (e) {
@@ -242,6 +263,10 @@ async function flashFirmware(targetFirmware) {
         console.log('[FLASH] Device path:', currentDevice.path);
         
         if (currentDevice.type === 'santroller') {
+            if (versionForFlash !== 'v1' && versionForFlash !== 'v2') {
+                throw new Error('Cannot determine hardware version from device. Flash blocked to avoid applying wrong firmware variant.');
+            }
+
             console.log('[FLASH] Calling Santroller USB reboot...');
             await window.electronAPI.resetSantrollerHID(currentDevice.path);
             
@@ -250,14 +275,18 @@ async function flashFirmware(targetFirmware) {
             updateProgress(50, 'Waiting for bootloader...');
             
             // Use new API that waits for BOOTSEL, reads version, then flashes
-            await window.electronAPI.startFlashWithVersionDetection(targetFirmware);
+            await window.electronAPI.startFlashWithVersionDetection(targetFirmware, versionForFlash);
         } else if (currentDevice.type === 'classic') {
             console.log('[FLASH] Calling Classic serial reboot...');
             await window.electronAPI.resetClassicSerial(currentDevice.path);
             
             // For Classic, we already know the version, so flash directly
             updateProgress(50, 'Waiting for bootloader...');
-            const firmwareName = `${targetFirmware === 'classic' ? 'Classic' : 'Santroller'}-${hardwareVersion}`;
+            if (versionForFlash !== 'v1' && versionForFlash !== 'v2') {
+                throw new Error('Cannot determine hardware version from device. Flash blocked to avoid applying wrong firmware variant.');
+            }
+
+            const firmwareName = `${targetFirmware === 'classic' ? 'Classic' : 'Santroller'}-${versionForFlash}`;
             const firmwareUrl = FIRMWARE_URLS[firmwareName];
             
             console.log('[FLASH] Firmware name:', firmwareName);
