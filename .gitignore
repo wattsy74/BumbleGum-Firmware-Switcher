@@ -1,0 +1,14 @@
+# Dependencies
+node_modules/
+
+# Build artifacts
+dist/
+out/
+build/
+
+# Logs
+*.log
+
+# OS/editor files
+.DS_Store
+.vscode/

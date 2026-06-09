@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Firmware Flasher</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🎸 Firmware Flasher</h1>
+            <p class="subtitle">Automated Classic ↔ Santroller firmware switching</p>
+        </header>
+
+        <main>
+            <!-- Connection Section -->
+            <section class="card">
+                <h2>1. Connect Your Device</h2>
+                
+                <div class="connection-tabs">
+                    <button class="tab-btn active" data-tab="classic">Classic Firmware</button>
+                    <button class="tab-btn" data-tab="santroller">Santroller Firmware</button>
+                </div>
+
+                <div class="tab-content" id="classic-tab">
+                    <p class="info">For devices running Classic firmware (VID 0x6997)</p>
+                    <button id="refreshSerial" class="btn btn-secondary">🔄 Refresh Serial Ports</button>
+                    <select id="serialPortList" class="device-select">
+                        <option value="">Select serial port...</option>
+                    </select>
+                    <button id="connectSerial" class="btn btn-primary" disabled>Connect via Serial</button>
+                </div>
+
+                <div class="tab-content hidden" id="santroller-tab">
+                    <p class="info">For devices running Santroller firmware (VID 0x1209) - Fully Automated!</p>
+                    <button id="refreshHID" class="btn btn-secondary">🔄 Refresh HID Devices</button>
+                    <select id="hidDeviceList" class="device-select">
+                        <option value="">Select Santroller device...</option>
+                    </select>
+                    <button id="connectHID" class="btn btn-primary" disabled>Connect via HID</button>
+                </div>
+
+                <div id="deviceInfo" class="device-info hidden">
+                    <div class="info-row">
+                        <span class="label">Status:</span>
+                        <span class="value" id="deviceStatus">—</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="label">Firmware:</span>
+                        <span class="value" id="deviceFirmware">—</span>
+                    </div>
+                    <button id="disconnect" class="btn btn-secondary btn-small">Disconnect</button>
+                </div>
+            </section>
+
+            <!-- Firmware Selection -->
+            <section class="card" id="firmwareSection">
+                <h2>2. Select Target Firmware</h2>
+                <div class="firmware-grid">
+                    <button class="firmware-card" data-firmware="Classic1">
+                        <div class="firmware-name">Classic 1</div>
+                        <div class="firmware-desc">Original Classic firmware</div>
+                    </button>
+                    <button class="firmware-card" data-firmware="Classic2">
+                        <div class="firmware-name">Classic 2</div>
+                        <div class="firmware-desc">Updated Classic firmware</div>
+                    </button>
+                    <button class="firmware-card" data-firmware="Santroller">
+                        <div class="firmware-name">Santroller</div>
+                        <div class="firmware-desc">Santroller Guitar firmware</div>
+                    </button>
+                </div>
+            </section>
+
+            <!-- Flash Button -->
+            <section class="card" id="flashSection">
+                <button id="flashBtn" class="btn btn-flash" disabled>Select Firmware to Flash</button>
+            </section>
+
+            <!-- Progress -->
+            <section class="card hidden" id="progressSection">
+                <h3>Flashing Progress</h3>
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progressFill"></div>
+                </div>
+                <p class="progress-text" id="progressText">Initializing...</p>
+                <div id="progressLog" class="progress-log"></div>
+            </section>
+        </main>
+
+        <footer>
+            <p>Firmware Flasher v1.0.0 | Native Desktop App</p>
+            <p class="footer-note">✨ Fully automated • No browser restrictions • BOOTSEL button not required!</p>
+        </footer>
+    </div>
+
+    <script src="renderer.js"></script>
+</body>
+</html>

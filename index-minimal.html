@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BumbleGum Firmware Switcher</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+            background: #1a1a1a;
+            color: #EFCF5F;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: #2a2a2a;
+            border-radius: 16px;
+            padding: 40px;
+            max-width: 500px;
+            width: 100%;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        .logo {
+            width: 60px;
+            height: 60px;
+            margin: 0 auto 15px;
+            display: block;
+        }
+
+        h1 {
+            font-size: 24px;
+            color: #EFCF5F;
+        }
+
+        .device-status {
+            background: #1a1a1a;
+            padding: 20px;
+            border-radius: 12px;
+            margin-bottom: 30px;
+            text-align: center;
+        }
+
+        .device-name {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: #EFCF5F;
+        }
+
+        .device-fw {
+            font-size: 14px;
+            color: #999;
+        }
+
+        .status-dot {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+
+        .status-dot.connected { background: #10b981; }
+        .status-dot.disconnected { background: #ef4444; }
+
+        .firmware-actions {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+
+        .action-btn {
+            width: 100%;
+            background: #EFCF5F;
+            color: #1a1a1a;
+            border: none;
+            border-radius: 12px;
+            padding: 24px;
+            font-size: 18px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: none;
+        }
+
+        .action-btn.visible {
+            display: block;
+        }
+
+        .action-btn:hover:not(:disabled) {
+            background: #d4b84f;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 16px rgba(239, 207, 95, 0.3);
+        }
+
+        .action-btn:disabled {
+            background: #3a3a3a;
+            color: #666;
+            cursor: not-allowed;
+        }
+
+        .hw-version {
+            font-size: 11px;
+            opacity: 0.7;
+            margin-top: 4px;
+        }
+
+        .progress {
+            margin-top: 20px;
+            display: none;
+        }
+
+        .progress.visible {
+            display: block;
+        }
+
+        .progress-bar {
+            background: #1a1a1a;
+            border-radius: 10px;
+            height: 6px;
+            overflow: hidden;
+            margin-bottom: 10px;
+        }
+
+        .progress-fill {
+            background: #EFCF5F;
+            height: 100%;
+            width: 0%;
+            transition: width 0.3s;
+        }
+
+        .progress-text {
+            text-align: center;
+            color: #999;
+            font-size: 13px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <img src="bee-logo.png" alt="BumbleGum" class="logo" id="logo">
+            <h1>BumbleGum Firmware Switcher</h1>
+        </div>
+
+        <div class="device-status">
+            <div class="device-name">
+              <span class="status-dot disconnected" id="statusDot"></span>
+                <span id="deviceName">Searching...</span>
+            </div>
+            <div class="device-fw" id="currentFW">No device</div>
+            <div class="hw-version" id="hwVersion"></div>
+        </div>
+
+        <div class="firmware-actions">
+            <button class="action-btn" id="switchToClassic">
+                Switch to Classic
+            </button>
+            <button class="action-btn" id="switchToSantroller">
+                Switch to Santroller
+            </button>
+        </div>
+
+        <div class="progress" id="progress">
+            <div class="progress-bar">
+                <div class="progress-fill" id="progressFill"></div>
+            </div>
+            <div class="progress-text" id="progressText">Preparing...</div>
+        </div>
+    </div>
+
+    <script src="renderer-minimal.js"></script>
+</body>
+</html>
