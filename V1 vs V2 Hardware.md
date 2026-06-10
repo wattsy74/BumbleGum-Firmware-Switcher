@@ -28,4 +28,5 @@ The differences in the hardware dictates the configuration to be different and t
 
 # Firmware files
 | Classic-v1.uf2 | Santroller-v1.uf2 |
+| ---- | ---- |
 | Classic-v2.uf2 | Santroller-v2.uf2 |
