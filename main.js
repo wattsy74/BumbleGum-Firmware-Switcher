@@ -1054,7 +1054,7 @@ ipcMain.handle('read-classic-config', async (event, portPath) => {
                             const neopixelPin = config.neopixel_pin || '';
                             let version = 'v2'; // Default to v2 (latest hardware)
                             
-                            if (neopixelPin.includes('10')) {
+                            if (neopixelPin.includes('23')) {
                                 version = 'v1';
                                 logSerial('[CONFIG] ✓ Detected v1 hardware (neopixel_pin: ' + neopixelPin + ')');
                             } else if (neopixelPin.includes('13')) {
