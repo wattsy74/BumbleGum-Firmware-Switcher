@@ -998,25 +998,51 @@ ipcMain.handle('flash-to-bootsel', async (event, firmware, url, bootselPath) => 
 // Download firmware file
 async function downloadFirmware(firmware, url) {
     const cacheFile = path.join(CACHE_DIR, `${firmware}.uf2`);
+    const cacheMetaFile = path.join(CACHE_DIR, `${firmware}.meta.json`);
+
+    if (!url || typeof url !== 'string') {
+        const knownFirmwareKeys = Object.keys(FIRMWARE_URLS).join(', ');
+        throw new Error(`No firmware URL configured for ${firmware}. Known firmware keys: ${knownFirmwareKeys}`);
+    }
+
+    let normalizedUrl;
+    try {
+        normalizedUrl = new URL(url).toString();
+    } catch (error) {
+        throw new Error(`Invalid firmware URL for ${firmware}: ${url}`);
+    }
     
     // Check cache
     if (fs.existsSync(cacheFile)) {
         const stats = fs.statSync(cacheFile);
         const age = Date.now() - stats.mtimeMs;
+        let cacheMatchesUrl = false;
+
+        if (fs.existsSync(cacheMetaFile)) {
+            try {
+                const meta = JSON.parse(fs.readFileSync(cacheMetaFile, 'utf-8'));
+                cacheMatchesUrl = meta && meta.url === normalizedUrl;
+            } catch (error) {
+                console.warn('[DOWNLOAD] Could not read cache metadata, forcing re-download:', error.message);
+            }
+        }
         
-        // Use cached file if less than 24 hours old and size > 0
-        if (age < 86400000 && stats.size > 0) {
+        // Use cached file only when URL matches and file is recent/non-empty.
+        if (age < 86400000 && stats.size > 0 && cacheMatchesUrl) {
             console.log(`Using cached firmware: ${cacheFile} (${stats.size} bytes)`);
             return cacheFile;
         } else {
-            console.log(`Cache expired or invalid, re-downloading...`);
+            console.log(`Cache expired, mismatched, or invalid; re-downloading...`);
             try {
                 fs.unlinkSync(cacheFile);
+            } catch (e) {}
+            try {
+                fs.unlinkSync(cacheMetaFile);
             } catch (e) {}
         }
     }
     
-    console.log(`Downloading firmware from ${url}`);
+    console.log(`Downloading firmware from ${normalizedUrl}`);
     
     return new Promise((resolve, reject) => {
         const doDownload = (downloadUrl, attempt = 1) => {
@@ -1077,6 +1103,20 @@ async function downloadFirmware(firmware, url) {
                                 } catch (e) {}
                                 reject(new Error(`Downloaded file is too small (${stats.size} bytes). Expected firmware file.`));
                             } else {
+                                try {
+                                    fs.writeFileSync(
+                                        cacheMetaFile,
+                                        JSON.stringify({
+                                            firmware,
+                                            url: normalizedUrl,
+                                            size: stats.size,
+                                            downloadedAt: new Date().toISOString()
+                                        }, null, 2),
+                                        'utf-8'
+                                    );
+                                } catch (metaError) {
+                                    console.warn('[DOWNLOAD] Could not write cache metadata:', metaError.message);
+                                }
                                 resolve(cacheFile);
                             }
                         } catch (error) {
@@ -1103,7 +1143,7 @@ async function downloadFirmware(firmware, url) {
         };
         
         // Start download
-        doDownload(url);
+        doDownload(normalizedUrl);
     });
 }
 
