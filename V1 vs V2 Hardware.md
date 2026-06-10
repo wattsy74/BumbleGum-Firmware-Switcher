@@ -1,7 +1,7 @@
 # V1 vs V2 Hardware
 
-Version 1 controllers use a RP2040 pico controller with a larger footprint which mounts on a supporting lasercut frame.
-Version 2 controllers use still use a RP2040 but on the Pico Zero which has a smaller form and mounts to a custom PCB.
+- Version 1 controllers use a RP2040 pico controller with a larger footprint which mounts on a supporting lasercut frame.
+- Version 2 controllers use still use a RP2040 but on the Pico Zero which has a smaller form and mounts to a custom PCB.
 
 # Controller Pin Assignment
 | Input | V1 Pin | v2 Pin |
