@@ -7,5 +7,5 @@
 - [ ] Make Release
 - [ ] Make instructional video
 - [ ] Put on Website
-- [ ] Look at mapping the pins used on the RetroCultMods Board
+- [ ] Map the pins used on the RetroCultMods Board
 - [ ] Test Classic Firmware on the RCM board (LED's might be an issue)
