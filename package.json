@@ -20,7 +20,7 @@
     "santroller",
     "rp2040"
   ],
-  "author": "Your Name",
+  "author": "Martyn Watts",
   "license": "MIT",
   "dependencies": {
     "node-hid": "^2.1.2",
