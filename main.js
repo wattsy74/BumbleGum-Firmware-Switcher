@@ -130,7 +130,7 @@ function parseHardwareVersionFromText(text) {
     return null;
 }
 
-// Firmware URLs - v1 (pin 10) vs v2 (pin 13) hardware variants
+// Firmware URLs - v1 (pin 23) vs v2 (pin 13) hardware variants
 const FIRMWARE_URLS = {
     // Classic firmware variants
     'Classic-v1': 'https://github.com/wattsy74/BumbleGum-Configurator-Santroller/releases/latest/download/Classic-v1.uf2',
