@@ -23,3 +23,9 @@
 | D-Pad Guide | 6 | 7 |
 | Whammy | 27 | 29 |
 | LED Data | 23 | 13 |
+
+The differences in the hardware dictates the configuration to be different and therefore separate firmwares required.  Allowing the move between Classic and Santroller based firmwares required detection of hardware types to ensure the controller continued to function as expected and the creation of 4 firmware files.
+
+# Firmware files
+| Classic-v1.uf2 | Santroller-v1.uf2 |
+| Classic-v2.uf2 | Santroller-v2.uf2 |
