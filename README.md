@@ -1,9 +1,9 @@
 # To Do
 
-- [ ] Test firmware switching on V1 hardware
-- [ ] Fix the quitting of the app
-- [ ] Disable the console
-- [ ] Build and Test on Windows & Linux
+- [x] Test firmware switching on V1 hardware
+- [x] Fix the quitting of the app
+- [x] Disable the console
+- [x] Build and Test on Windows & Linux
 - [ ] Document the app
 - [ ] Make Release
 - [ ] Make instructional video
