@@ -27,6 +27,136 @@ function uniq(arr) {
     return [...new Set(arr)];
 }
 
+// Copy helper with retries to handle transient mount races (Windows BOOTSEL)
+// Implements exponential backoff, destination existence/writability checks,
+// and post-copy size verification.
+async function copyFileWithRetries(src, dest, attempts = 8, delayMs = 300) {
+    // Helper to check destination directory exists and is writable
+    function destWritable(destPath) {
+        try {
+            const root = path.parse(destPath).root; // e.g., 'D:\'
+            // Check that root exists and is writable
+            fs.accessSync(root, fs.constants.W_OK);
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    const srcStats = fs.existsSync(src) ? fs.statSync(src) : null;
+    if (!srcStats || srcStats.size === 0) {
+        throw new Error(`Source firmware missing or empty: ${src}`);
+    }
+
+    for (let i = 1; i <= attempts; i++) {
+        try {
+            console.log(`[COPY] Attempt ${i}/${attempts}: copying ${src} -> ${dest}`);
+            logSerial(`[COPY] Attempt ${i}/${attempts}: copying ${src} -> ${dest}`);
+
+            // If destination root not writable yet, fail fast to trigger retry/backoff
+            if (!destWritable(dest)) {
+                const errMsg = `Destination not writable yet: ${dest}`;
+                console.warn('[COPY] ' + errMsg);
+                logSerial('[COPY] ' + errMsg);
+                throw new Error(errMsg);
+            }
+
+            // Perform copy (synchronous to minimize race windows)
+            fs.copyFileSync(src, dest);
+
+            // Verify destination exists and matches source size
+            const destStats = fs.existsSync(dest) ? fs.statSync(dest) : null;
+            if (!destStats) {
+                throw new Error('Destination file not found after copy');
+            }
+
+            if (destStats.size === 0) {
+                throw new Error('Copied file is 0 bytes');
+            }
+
+            // On Windows, sometimes a small delay is needed before size stabilizes; wait briefly
+            await sleep(100);
+            const destStatsAfter = fs.statSync(dest);
+            if (destStatsAfter.size !== srcStats.size) {
+                const msg = `Size mismatch after copy. src=${srcStats.size}, dest=${destStatsAfter.size}`;
+                console.warn('[COPY] ' + msg);
+                logSerial('[COPY] ' + msg);
+                // treat as failure and retry
+                throw new Error(msg);
+            }
+
+            console.log(`[COPY] Attempt ${i}: success (${destStatsAfter.size} bytes)`);
+            logSerial(`[COPY] Attempt ${i}: success (${destStatsAfter.size} bytes)`);
+            return;
+        } catch (e) {
+            console.warn(`[COPY] Attempt ${i} failed: ${e && e.message ? e.message : e}`);
+            logSerial(`[COPY] Attempt ${i} failed: ${e && e.message ? e.message : e}`);
+            if (i === attempts) {
+                throw e;
+            }
+
+            // Exponential backoff
+            const backoff = Math.min(2000, delayMs * Math.pow(2, i - 1));
+            console.log(`[COPY] Waiting ${backoff}ms before retrying...`);
+            await sleep(backoff);
+        }
+    }
+}
+
+// Wait for BOOTSEL mount to be ready: check for marker files or writable root
+async function waitForBootselMount(bootselPath, timeoutMs = 20000) {
+    const start = Date.now();
+    const markers = ['INFO_UF2.TXT', 'INDEX.HTM', 'INDEX.HTML', 'hardware_version.txt'];
+
+    while (Date.now() - start < timeoutMs) {
+        try {
+            // Check root exists
+            if (!fs.existsSync(bootselPath)) {
+                // Wait a bit
+                await sleep(250);
+                continue;
+            }
+
+            // List entries for diagnostics
+            try {
+                const entries = fs.readdirSync(bootselPath);
+                console.log('[MOUNT] Directory entries at', bootselPath, ':', entries.join(', '));
+                logSerial('[MOUNT] Directory entries at ' + bootselPath + ': ' + entries.join(', '));
+                // If any marker files present consider it mounted
+                for (const m of markers) {
+                    if (entries.includes(m)) {
+                        console.log('[MOUNT] Found marker file:', m);
+                        logSerial('[MOUNT] Found marker file: ' + m);
+                        return true;
+                    }
+                }
+            } catch (e) {
+                console.warn('[MOUNT] Could not list directory yet:', e.message);
+                logSerial('[MOUNT] Could not list directory yet: ' + e.message);
+            }
+
+            // Check writability
+            try {
+                fs.accessSync(bootselPath, fs.constants.W_OK);
+                console.log('[MOUNT] Destination root writable:', bootselPath);
+                logSerial('[MOUNT] Destination root writable: ' + bootselPath);
+                return true;
+            } catch (e) {
+                // Not writable yet
+            }
+
+            await sleep(300);
+        } catch (e) {
+            // continue polling
+            await sleep(300);
+        }
+    }
+
+    console.warn('[MOUNT] Timeout waiting for BOOTSEL mount at', bootselPath);
+    logSerial('[MOUNT] Timeout waiting for BOOTSEL mount at ' + bootselPath);
+    return false;
+}
+
 let mainWindow;
 let flashWatcher = null;
 
@@ -157,8 +287,7 @@ function createWindow() {
 
     mainWindow.loadFile('index-minimal.html');
     
-    // Open DevTools for debugging HID commands
-    mainWindow.webContents.openDevTools();
+    // DevTools no longer opened automatically to avoid stealing focus on launch
 }
 
 app.whenReady().then(() => {
@@ -242,7 +371,7 @@ ipcMain.handle('detect-bootsel', async () => {
             console.error('[BOOTSEL] Error reading /Volumes:', e.message);
         }
     } else if (platform === 'win32') {
-        // Windows
+        // Windows - try WMIC first (volume label), then fallback to scanning drive letters
         const { execSync } = require('child_process');
         try {
             const output = execSync('wmic logicaldisk get name,volumename', { encoding: 'utf8' });
@@ -252,14 +381,44 @@ ipcMain.handle('detect-bootsel', async () => {
                 if (line.includes('RPI-RP2') || line.includes('RPI_RP2')) {
                     const match = line.match(/([A-Z]:)/);
                     if (match) {
-                        const drivePath = match[1] + '\\';
-                        console.log('[BOOTSEL] Detected at:', drivePath);
+                        const drivePath = match[1] + '\\\\';
+                        console.log('[BOOTSEL] Detected at (wmic):', drivePath);
                         return { found: true, path: drivePath };
                     }
                 }
             }
         } catch (e) {
-            console.error('[BOOTSEL] Error detecting Windows volume:', e.message);
+            console.error('[BOOTSEL] Error detecting Windows volume via WMIC:', e.message);
+        }
+
+        // WMIC didn't find it (or failed). Fall back to scanning A:..Z: for RP2040 marker files
+        try {
+            const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+            for (const ch of letters) {
+                const drive = ch + ':\\';
+                try {
+                    if (!fs.existsSync(drive)) continue;
+                    const files = fs.readdirSync(drive);
+                    const lower = files.map(f => String(f).toLowerCase());
+                    // RP2040 BOOTSEL volumes commonly contain INFO_UF2.TXT or INDEX.HTM
+                    if (lower.includes('info_uf2.txt') || lower.includes('index.htm') || lower.includes('index.html')) {
+                        console.log('[BOOTSEL] Detected at (scan):', drive);
+                        return { found: true, path: drive };
+                    }
+                    // Some volumes may have a root file named INFO.UF2 or other variants
+                    for (const f of lower) {
+                        if (f.includes('info') && f.includes('uf2')) {
+                            console.log('[BOOTSEL] Detected at (scan - info uf2):', drive);
+                            return { found: true, path: drive };
+                        }
+                    }
+                } catch (e) {
+                    // ignore inaccessible drives
+                    continue;
+                }
+            }
+        } catch (e) {
+            console.error('[BOOTSEL] Error scanning drives on Windows:', e.message);
         }
     } else {
         // Linux
@@ -440,80 +599,105 @@ ipcMain.handle('reset-santroller-hid', async (event, devicePath) => {
         const bmRequestType = 0x21;  // Class request, Host-to-Device, Interface
         const bRequest = 49;         // BOOTLOADER constant (0x31 in hex)
         const wValue = 0;
-        const wIndex = 0;
         const data = Buffer.alloc(0);  // No data phase
 
-        logHID('[USB] Sending control transfer:');
-        logHID(`  bmRequestType: 0x${bmRequestType.toString(16)} (${bmRequestType})`);
-        logHID(`  bRequest:      0x${bRequest.toString(16)} (${bRequest}) [BOOTLOADER]`);
-        logHID(`  wValue:        ${wValue}`);
-        logHID(`  wIndex:        ${wIndex}`);
-        logHID(`  data length:   ${data.length}`);
-        logHID('');
+        logHID('[USB] Preparing control transfer attempts (trying common interface indices)...');
 
-        return new Promise((resolve, reject) => {
-            usbDevice.controlTransfer(
-                bmRequestType,
-                bRequest,
-                wValue,
-                wIndex,
-                data,
-                (error, returnedData) => {
-                    // Close device regardless of result
-                    try {
-                        usbDevice.close();
-                    } catch (e) {
-                        // Ignore close errors
-                    }
-
-                    if (error) {
-                        // errno 19 (LIBUSB_ERROR_NO_DEVICE) means device rebooted successfully!
-                        if (error.errno === 19 ||
-                            (error.message && (
-                                error.message.includes('LIBUSB_ERROR_NO_DEVICE') ||
-                                error.message.includes('No such device') ||
-                                error.message.includes('device is gone')
-                            ))) {
-                            logHID('[USB] ✓ Control transfer sent!');
-                            logHID('[USB] ✓ Device disconnected (errno 19 = device rebooted!)');
-                            logHID('');
-                            logHID('🎉 SUCCESS! Device is rebooting into BOOTSEL mode!');
-                            logHID('   Waiting for RPI-RP2 volume to appear...');
-                            logHID('========================================\n');
-                            resolve({ success: true });
-                        } else {
-                            logHID(`[USB] ✗ Control transfer failed: ${error.message}`);
-                            logHID(`[USB] Error details: errno=${error.errno}`);
-                            logHID('========================================\n');
-                            reject(new Error(`USB control transfer failed: ${error.message}`));
-                        }
-                    } else {
-                        logHID('[USB] ✓ Control transfer completed successfully');
-                        logHID('');
-                        
-                        // Check if device disappeared (success indicator)
-                        setTimeout(() => {
-                            const devicesAfter = usb.getDeviceList();
-                            const stillPresent = devicesAfter.some(d => {
-                                const desc = d.deviceDescriptor;
-                                return desc.idVendor === selected.vendorId && desc.idProduct === selected.productId;
-                            });
-                            
-                            if (!stillPresent) {
-                                logHID('[USB] 🎉 Device disconnected - entering BOOTSEL mode!');
-                                logHID('========================================\n');
-                                resolve({ success: true });
+        // Helper to perform a single control transfer attempt
+        const attemptControlTransfer = (wIndex) => {
+            return new Promise((resolve, reject) => {
+                logHID(`[USB] Attempting controlTransfer with wIndex=${wIndex}`);
+                try {
+                    usbDevice.controlTransfer(
+                        bmRequestType,
+                        bRequest,
+                        wValue,
+                        wIndex,
+                        data,
+                        (error, returnedData) => {
+                            if (error) {
+                                // If device disappeared, consider success
+                                if (error.errno === 19 || (error.message && (
+                                    error.message.includes('LIBUSB_ERROR_NO_DEVICE') ||
+                                    error.message.includes('No such device') ||
+                                    error.message.includes('device is gone')
+                                ))) {
+                                    logHID('[USB] ✓ Control transfer triggered device disconnect (reboot to BOOTSEL)');
+                                    resolve({ success: true, rebooted: true });
+                                } else {
+                                    logHID(`[USB] Attempt wIndex=${wIndex} failed: ${error.message} (errno=${error.errno})`);
+                                    reject(error);
+                                }
                             } else {
-                                logHID('[USB] ⚠️  Device still present after 2 seconds');
-                                logHID('[USB] Command may not have worked, or device takes longer to reboot');
-                                logHID('========================================\n');
-                                resolve({ success: true, warning: 'Device may not have rebooted' });
+                                logHID(`[USB] Attempt wIndex=${wIndex} completed without error`);
+                                resolve({ success: true, rebooted: false });
                             }
-                        }, 2000);
+                        }
+                    );
+                } catch (e) {
+                    reject(e);
+                }
+            });
+        };
+
+        // Try common interface indices: 1 then 0, then any available interface number
+        const candidateIndices = [1, 0].concat((usbDevice.interfaces || []).map((iface) => {
+            // interfaceNumber or descriptor.bInterfaceNumber may be present
+            return (iface.interfaceNumber !== undefined) ? iface.interfaceNumber : (iface.descriptor && iface.descriptor.bInterfaceNumber !== undefined ? iface.descriptor.bInterfaceNumber : null);
+        }).filter(i => i !== null));
+
+        // Deduplicate
+        const seen = new Set();
+        const candidates = [];
+        for (const c of candidateIndices) {
+            if (!seen.has(c)) { seen.add(c); candidates.push(c); }
+        }
+
+        let lastError = null;
+        for (const idx of candidates) {
+            try {
+                // Try without claiming first
+                const res = await attemptControlTransfer(idx);
+                try { usbDevice.close(); } catch (e) {}
+                // If transfer indicates device disconnected, success
+                if (res.rebooted) return { success: true };
+                // If it completed successfully but device still present, still treat as success (will verify later)
+                return { success: true };
+            } catch (err) {
+                lastError = err;
+
+                // If invalid param, try claiming the interface and retry once
+                if (err && (err.message && err.message.includes('LIBUSB_ERROR_INVALID_PARAM'))) {
+                    logHID(`[USB] LIBUSB_ERROR_INVALID_PARAM for wIndex=${idx}, attempting to claim interface and retry`);
+                    try {
+                        const iface = usbDevice.interface(idx);
+                        try { iface.claim(); } catch (claimErr) { logHID('[USB] Could not claim interface: ' + claimErr.message); }
+                        try {
+                            const res2 = await attemptControlTransfer(idx);
+                            try { usbDevice.close(); } catch (e) {}
+                            if (res2.rebooted) return { success: true };
+                            return { success: true };
+                        } catch (err2) {
+                            lastError = err2;
+                            try { iface.release(true, () => {}); } catch (e) {}
+                        }
+                    } catch (claimEx) {
+                        logHID('[USB] Could not access interface for claiming: ' + claimEx.message);
                     }
                 }
-            );
-        });
+                // Otherwise continue to next candidate
+                logHID(`[USB] Continuing to next candidate after failure for wIndex=${idx}`);
+            }
+        }
+
+        // All attempts failed
+        try { usbDevice.close(); } catch (e) {}
+        logHID('[USB] ✗ All control transfer attempts failed');
+        if (lastError) {
+            logHID(`[USB] Last error: ${lastError.message} (errno=${lastError.errno})`);
+            throw new Error(`USB control transfer failed: ${lastError.message}`);
+        }
+        throw new Error('USB control transfer failed (unknown reason)');
     } catch (error) {
         logHID(`[USB] ERROR: ${error.message}`);
         logHID('========================================\n');
@@ -523,9 +707,15 @@ ipcMain.handle('reset-santroller-hid', async (event, devicePath) => {
 
 // Watch for BOOTSEL and flash firmware
 ipcMain.handle('start-flash', async (event, firmware, url) => {
+    // Keep the app visible while flashing so Explorer/autoplay windows don't obscure it
+    let prevAlwaysOnTop = false;
     try {
         console.log(`Starting flash process for ${firmware}`);
-        
+        if (mainWindow) {
+            try { prevAlwaysOnTop = mainWindow.isAlwaysOnTop(); } catch (e) { prevAlwaysOnTop = false; }
+            try { mainWindow.setAlwaysOnTop(true); mainWindow.focus(); } catch (e) { console.warn('[UI] Could not set always-on-top:', e.message); }
+        }
+
         // Download firmware if needed
         const firmwarePath = await downloadFirmware(firmware, url);
         
@@ -536,27 +726,39 @@ ipcMain.handle('start-flash', async (event, firmware, url) => {
         // Start watching for BOOTSEL
         const result = await watchAndFlash(firmwarePath, (progress) => {
             // Send progress updates to renderer
-            mainWindow.webContents.send('flash-progress', progress);
+            if (mainWindow) mainWindow.webContents.send('flash-progress', progress);
         });
         
         return result;
     } catch (error) {
         console.error('Flash error:', error);
         throw error;
+    } finally {
+        // Restore previous always-on-top state
+        if (mainWindow) {
+            try { mainWindow.setAlwaysOnTop(!!prevAlwaysOnTop); } catch (e) { }
+        }
     }
 });
 
 // Watch for BOOTSEL, read hardware version, then flash appropriate firmware variant
 // Used when switching FROM Santroller firmware where we can't read config.json
 ipcMain.handle('start-flash-with-version-detection', async (event, targetFirmware, hardwareVersion) => {
+    // Keep the app visible while flashing so Explorer/autoplay windows don't obscure it
+    let prevAlwaysOnTop = false;
     try {
+        if (mainWindow) {
+            try { prevAlwaysOnTop = mainWindow.isAlwaysOnTop(); } catch (e) { prevAlwaysOnTop = false; }
+            try { mainWindow.setAlwaysOnTop(true); mainWindow.focus(); } catch (e) { console.warn('[UI] Could not set always-on-top:', e.message); }
+        }
+
         console.log(`[FLASH] Starting version-detection flash for ${targetFirmware}`);
         
         // Wait for BOOTSEL to appear
         const timeout = 120000;
         const startTime = Date.now();
         
-        mainWindow.webContents.send('flash-progress', {
+        if (mainWindow) mainWindow.webContents.send('flash-progress', {
             status: 'waiting',
             message: 'Waiting for BOOTSEL volume...'
         });
@@ -593,7 +795,7 @@ ipcMain.handle('start-flash-with-version-detection', async (event, targetFirmwar
                         console.log(`[FLASH] Selected firmware: ${firmwareName}`);
                         console.log(`[FLASH] Firmware URL: ${firmwareUrl}`);
                         
-                        mainWindow.webContents.send('flash-progress', {
+                        if (mainWindow) mainWindow.webContents.send('flash-progress', {
                             status: 'downloading',
                             message: `Downloading ${firmwareName}...`
                         });
@@ -605,7 +807,7 @@ ipcMain.handle('start-flash-with-version-detection', async (event, targetFirmwar
                             throw new Error('Failed to download firmware');
                         }
                         
-                        mainWindow.webContents.send('flash-progress', {
+                        if (mainWindow) mainWindow.webContents.send('flash-progress', {
                             status: 'flashing',
                             message: 'Copying firmware to device...'
                         });
@@ -614,14 +816,35 @@ ipcMain.handle('start-flash-with-version-detection', async (event, targetFirmwar
                         const destPath = path.join(bootselPath, path.basename(firmwarePath));
                         
                         console.log(`[COPY] Source: ${firmwarePath}`);
+                        logSerial(`[COPY] Source: ${firmwarePath}`);
                         const sourceStats = fs.statSync(firmwarePath);
                         console.log(`[COPY] Source size: ${sourceStats.size} bytes`);
+                        logSerial(`[COPY] Source size: ${sourceStats.size} bytes`);
                         console.log(`[COPY] Destination: ${destPath}`);
+                        logSerial(`[COPY] Destination: ${destPath}`);
                         
-                        fs.copyFileSync(firmwarePath, destPath);
+                        // Wait for BOOTSEL mount to be ready (markers/writability)
+                            const mounted = await waitForBootselMount(bootselPath, 20000);
+                        if (!mounted) {
+                            throw new Error('BOOTSEL mount not ready (timeout)');
+                        }
+
+                        // Directory listing for diagnostics before copy
+                        try {
+                            const preList = fs.readdirSync(bootselPath);
+                            console.log('[COPY] Pre-copy directory listing:', preList.join(', '));
+                            logSerial('[COPY] Pre-copy directory listing: ' + preList.join(', '));
+                        } catch (e) {
+                            console.warn('[COPY] Could not list BOOTSEL root before copy:', e.message);
+                            logSerial('[COPY] Could not list BOOTSEL root before copy: ' + e.message);
+                        }
+
+                        // Use retrying copy helper for robustness
+                        await copyFileWithRetries(firmwarePath, destPath, 3, 500);
                         
                         const destStats = fs.statSync(destPath);
                         console.log(`[COPY] Copied ${destStats.size} bytes`);
+                        logSerial(`[COPY] Copied ${destStats.size} bytes`);
                         
                         if (destStats.size === 0) {
                             throw new Error('Copied file is 0 bytes - copy failed');
@@ -674,7 +897,14 @@ ipcMain.handle('start-flash-with-version-detection', async (event, targetFirmwar
 
 // Flash directly to BOOTSEL (device already in bootloader mode)
 ipcMain.handle('flash-to-bootsel', async (event, firmware, url, bootselPath) => {
+    // Keep the app visible while flashing so Explorer/autoplay windows don't obscure it
+    let prevAlwaysOnTop = false;
     try {
+        if (mainWindow) {
+            try { prevAlwaysOnTop = mainWindow.isAlwaysOnTop(); } catch (e) { prevAlwaysOnTop = false; }
+            try { mainWindow.setAlwaysOnTop(true); mainWindow.focus(); } catch (e) { console.warn('[UI] Could not set always-on-top:', e.message); }
+        }
+
         console.log(`Direct flash to BOOTSEL for ${firmware}`);
         
         // Download firmware if needed
@@ -684,7 +914,7 @@ ipcMain.handle('flash-to-bootsel', async (event, firmware, url, bootselPath) => 
             throw new Error('Failed to download firmware');
         }
         
-        mainWindow.webContents.send('flash-progress', {
+        if (mainWindow) mainWindow.webContents.send('flash-progress', {
             status: 'flashing',
             message: 'Copying firmware to BOOTSEL device...'
         });
@@ -692,15 +922,35 @@ ipcMain.handle('flash-to-bootsel', async (event, firmware, url, bootselPath) => 
         // Copy directly
         const destPath = path.join(bootselPath, path.basename(firmwarePath));
         
-        console.log(`[COPY] Source: ${firmwarePath}`);
-        const sourceStats = fs.statSync(firmwarePath);
-        console.log(`[COPY] Source size: ${sourceStats.size} bytes`);
-        console.log(`[COPY] Destination: ${destPath}`);
-        
-        fs.copyFileSync(firmwarePath, destPath);
-        
-        const destStats = fs.statSync(destPath);
-        console.log(`[COPY] Copied ${destStats.size} bytes`);
+                        console.log(`[COPY] Source: ${firmwarePath}`);
+                        logSerial(`[COPY] Source: ${firmwarePath}`);
+                        const sourceStats = fs.statSync(firmwarePath);
+                        console.log(`[COPY] Source size: ${sourceStats.size} bytes`);
+                        logSerial(`[COPY] Source size: ${sourceStats.size} bytes`);
+                        console.log(`[COPY] Destination: ${destPath}`);
+                        logSerial(`[COPY] Destination: ${destPath}`);
+                        
+                        // Ensure mount is ready before copying
+                        const mountedDirect = await waitForBootselMount(bootselPath, 20000);
+                        if (!mountedDirect) {
+                            throw new Error('BOOTSEL mount not ready (timeout)');
+                        }
+
+                        try {
+                            const preList = fs.readdirSync(bootselPath);
+                            console.log('[COPY] Pre-copy directory listing:', preList.join(', '));
+                            logSerial('[COPY] Pre-copy directory listing: ' + preList.join(', '));
+                        } catch (e) {
+                            console.warn('[COPY] Could not list BOOTSEL root before copy:', e.message);
+                            logSerial('[COPY] Could not list BOOTSEL root before copy: ' + e.message);
+                        }
+
+                        // Use retrying copy helper for robustness
+                        await copyFileWithRetries(firmwarePath, destPath, 10, 500);
+                        
+                        const destStats = fs.statSync(destPath);
+                        console.log(`[COPY] Copied ${destStats.size} bytes`);
+                        logSerial(`[COPY] Copied ${destStats.size} bytes`);
         
         if (destStats.size === 0) {
             throw new Error('Copied file is 0 bytes - copy failed');
@@ -730,14 +980,18 @@ ipcMain.handle('flash-to-bootsel', async (event, firmware, url, bootselPath) => 
         
         console.log('[FLASH] ✓✓✓ Direct flash complete!');
         return { success: true };
-        
     } catch (error) {
         console.error('Direct flash error:', error);
-        mainWindow.webContents.send('flash-progress', {
+        if (mainWindow) mainWindow.webContents.send('flash-progress', {
             status: 'error',
             message: error.message
         });
         throw error;
+    } finally {
+        // Restore previous always-on-top state
+        if (mainWindow) {
+            try { mainWindow.setAlwaysOnTop(!!prevAlwaysOnTop); } catch (e) { }
+        }
     }
 });
 
@@ -862,6 +1116,9 @@ async function watchAndFlash(firmwarePath, progressCallback) {
     console.log('[WATCH] Starting BOOTSEL detection...');
     console.log('[WATCH] Platform:', platform);
     console.log('[WATCH] Timeout:', timeout / 1000, 'seconds');
+    logSerial('[WATCH] Starting BOOTSEL detection...');
+    logSerial('[WATCH] Platform: ' + platform);
+    logSerial('[WATCH] Timeout: ' + (timeout / 1000) + ' seconds');
     
     progressCallback({ status: 'waiting', message: 'Waiting for BOOTSEL volume...' });
     
@@ -878,38 +1135,85 @@ async function watchAndFlash(firmwarePath, progressCallback) {
             if (bootselPath) {
                 clearInterval(checkInterval);
                 console.log(`[FLASH] ✓ BOOTSEL detected at: ${bootselPath}`);
+                logSerial(`[FLASH] ✓ BOOTSEL detected at: ${bootselPath}`);
                 
                 // Give volume a moment to fully mount
                 setTimeout(() => {
-                    progressCallback({ status: 'flashing', message: 'Copying firmware to device...' });
-                    
-                    // Copy firmware
-                    const destPath = path.join(bootselPath, path.basename(firmwarePath));
-                    
-                    try {
-                        console.log(`[COPY] Copying ${firmwarePath} to ${destPath}`);
-                        fs.copyFileSync(firmwarePath, destPath);
-                        console.log(`[COPY] ✓ Firmware copied successfully`);
-                        
-                        // Sync on Unix systems
-                        if (platform !== 'win32') {
+                    (async () => {
+                        progressCallback({ status: 'flashing', message: 'Copying firmware to device...' });
+
+                        // Copy firmware
+                        const destPath = path.join(bootselPath, path.basename(firmwarePath));
+
+                        try {
+                            console.log(`[COPY] Copying ${firmwarePath} to ${destPath}`);
+                            logSerial(`[COPY] Copying ${firmwarePath} to ${destPath}`);
+
+                            // Pre-copy checks
                             try {
-                                console.log('[SYNC] Syncing filesystem...');
-                                require('child_process').execSync('sync');
-                                console.log('[SYNC] ✓ Sync complete');
+                                const srcStats = fs.statSync(firmwarePath);
+                                console.log(`[COPY] Source exists: ${firmwarePath} (${srcStats.size} bytes)`);
+                                logSerial(`[COPY] Source exists: ${firmwarePath} (${srcStats.size} bytes)`);
                             } catch (e) {
-                                console.warn('[SYNC] Sync failed (non-fatal):', e.message);
+                                console.error('[COPY] ✗ Source file does not exist or is inaccessible:', e.message);
+                                throw e;
                             }
+
+                            try {
+                                // Check destination directory writable by attempting access to the root path
+                                fs.accessSync(bootselPath, fs.constants.W_OK);
+                                console.log('[COPY] Destination writable check passed for', bootselPath);
+                                logSerial('[COPY] Destination writable check passed for ' + bootselPath);
+                            } catch (e) {
+                                console.warn('[COPY] ✗ Destination not writable or access denied:', e.message);
+                                logSerial('[COPY] ✗ Destination not writable or access denied: ' + e.message);
+                                // Continue to attempt copy; copy will likely throw but we log the access issue
+                            }
+
+                            // Wait for BOOTSEL mount to be ready (markers/writability)
+                            const mountedWatch = await waitForBootselMount(bootselPath, 10000);
+                            if (!mountedWatch) {
+                                throw new Error('BOOTSEL mount not ready (timeout)');
+                            }
+
+                            // Directory listing for diagnostics before copy
+                            try {
+                                const preList = fs.readdirSync(bootselPath);
+                                console.log('[COPY] Pre-copy directory listing:', preList.join(', '));
+                                logSerial('[COPY] Pre-copy directory listing: ' + preList.join(', '));
+                            } catch (e) {
+                                console.warn('[COPY] Could not list BOOTSEL root before copy:', e.message);
+                                logSerial('[COPY] Could not list BOOTSEL root before copy: ' + e.message);
+                            }
+
+                            // Use retrying copy helper for robustness
+                            await copyFileWithRetries(firmwarePath, destPath, 10, 500);
+                            console.log(`[COPY] ✓ Firmware copied successfully`);
+                            logSerial('[COPY] ✓ Firmware copied successfully');
+
+                            // Sync on Unix systems
+                            if (platform !== 'win32') {
+                                try {
+                                    console.log('[SYNC] Syncing filesystem...');
+                                    require('child_process').execSync('sync');
+                                    console.log('[SYNC] ✓ Sync complete');
+                                } catch (e) {
+                                    console.warn('[SYNC] Sync failed (non-fatal):', e.message);
+                                }
+                            }
+
+                            progressCallback({ status: 'complete', message: 'Flash complete!' });
+                            console.log('[FLASH] ✓✓✓ Flash complete!');
+                            resolve({ success: true });
+                        } catch (error) {
+                            console.error('[COPY] ✗ Copy failed:', error && error.message ? error.message : error);
+                            if (error && error.stack) console.error(error.stack);
+                            logSerial('[COPY] ✗ Copy failed: ' + (error && error.message ? error.message : String(error)));
+                            if (error && error.stack) logSerial(error.stack);
+                            progressCallback({ status: 'error', message: error.message || String(error) });
+                            reject(error);
                         }
-                        
-                        progressCallback({ status: 'complete', message: 'Flash complete!' });
-                        console.log('[FLASH] ✓✓✓ Flash complete!');
-                        resolve({ success: true });
-                    } catch (error) {
-                        console.error('[COPY] ✗ Copy failed:', error);
-                        progressCallback({ status: 'error', message: error.message });
-                        reject(error);
-                    }
+                    })();
                 }, 1000); // Wait 1 second for volume to fully mount
             } else if (Date.now() - startTime > timeout) {
                 clearInterval(checkInterval);
@@ -939,6 +1243,7 @@ function findBootselVolume() {
                     if (volume.includes('RPI-RP2') || volume.includes('RPI_RP2')) {
                         const fullPath = path.join(volumesDir, volume);
                         console.log('[DETECT] ✓ Found BOOTSEL:', fullPath);
+                        logSerial('[DETECT] ✓ Found BOOTSEL: ' + fullPath);
                         return fullPath;
                     }
                 }
@@ -961,6 +1266,7 @@ function findBootselVolume() {
                     if (match) {
                         const drivePath = match[1] + '\\';
                         console.log('[DETECT] ✓ Found BOOTSEL:', drivePath);
+                        logSerial('[DETECT] ✓ Found BOOTSEL: ' + drivePath);
                         return drivePath;
                     }
                 }

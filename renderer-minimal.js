@@ -8,6 +8,9 @@ const FIRMWARE_URLS = {
 let currentDevice = null;
 let hardwareVersion = 'unknown';
 let lastKnownHardwareVersion = 'unknown';
+// Pending flash info (used when renderer detects BOOTSEL but main didn't)
+let pendingFlash = null; // { firmwareName, firmwareUrl }
+let autoFlashActive = false;
 
 const statusDot = document.getElementById('statusDot');
 const deviceName = document.getElementById('deviceName');
@@ -52,6 +55,21 @@ async function detectDevice() {
                 : `Hardware: ${hardwareVersion.toUpperCase()}`;
             statusDot.className = 'status-dot connected';
             updateButtons('bootsel');
+            // If we have a pending flash (we previously initiated a reboot), try a renderer-initiated fallback copy
+            if (pendingFlash && !autoFlashActive) {
+                autoFlashActive = true;
+                console.log('[FLASH] Renderer detected BOOTSEL and has pending flash. Triggering direct copy fallback...');
+                try {
+                    await window.electronAPI.flashToBootsel(pendingFlash.firmwareName, pendingFlash.firmwareUrl, bootsel.path);
+                    console.log('[FLASH] Renderer-initiated flashToBootsel completed');
+                } catch (e) {
+                    console.error('[FLASH] Renderer-initiated flashToBootsel failed:', e && e.message ? e.message : e);
+                } finally {
+                    pendingFlash = null;
+                    autoFlashActive = false;
+                }
+            }
+
             return;
         }
 
@@ -111,31 +129,57 @@ async function detectDevice() {
             
             console.log('[DETECT] Available cu. ports:', cuPorts.map(p => p.path));
             
-            // If multiple ports, use the LAST one (highest number = data channel)
+            // If multiple ports, prefer the LAST one (highest number = data channel)
             // Console is usually cu.usbmodem2101, Data is cu.usbmodem2103
-            const classic = cuPorts[cuPorts.length - 1];
-            
+            // Try the preferred port first, but as a fallback try other ports when we get Access denied
+            let classic = cuPorts[cuPorts.length - 1];
             if (cuPorts.length > 1) {
-                console.log('[DETECT] Multiple ports detected, using LAST (data channel):', classic.path);
-                console.log('[DETECT] Skipping first port (console):', cuPorts[0].path);
+                console.log('[DETECT] Multiple ports detected, preferred (data) port:', classic.path);
+                console.log('[DETECT] Other available ports:', cuPorts.map(p => p.path).join(', '));
             }
-            
-            console.log('[DETECT] ✓ Classic device found:', classic);
-            console.log('[DETECT] ✓ Will connect to:', classic.path);
-            
-            // Read config.json to detect hardware version
-            try {
-                const configResult = await window.electronAPI.readClassicConfig(classic.path);
-                if (configResult.success) {
-                    hardwareVersion = configResult.version;
-                    lastKnownHardwareVersion = hardwareVersion;
-                    console.log('[DETECT] ✓ Hardware version from config.json:', hardwareVersion);
+
+            console.log('[DETECT] Will attempt to connect to classic ports (preferred first)');
+
+            let chosen = null;
+            // Try ports in order: preferred (last) down to first
+            for (let i = cuPorts.length - 1; i >= 0; i--) {
+                const candidate = cuPorts[i];
+                console.log('[DETECT] Trying port:', candidate.path);
+                try {
+                    const configResult = await window.electronAPI.readClassicConfig(candidate.path);
+                    if (configResult && configResult.success) {
+                        hardwareVersion = configResult.version;
+                        lastKnownHardwareVersion = hardwareVersion;
+                        console.log('[DETECT] ✓ Hardware version from config.json:', hardwareVersion);
+                    } else {
+                        console.log('[DETECT] Read config.json returned no success for', candidate.path);
+                    }
+                    chosen = candidate;
+                    console.log('[DETECT] ✓ Selected port:', candidate.path);
+                    break;
+                } catch (e) {
+                    // If access denied, try the next candidate. Otherwise, log and continue.
+                    console.warn('[DETECT] Could not read config.json on', candidate.path + ':', e.message);
+                    if (typeof e.message === 'string' && e.message.toLowerCase().includes('access denied')) {
+                        console.log('[DETECT] Access denied on', candidate.path, '- trying next available port');
+                        continue; // try next candidate
+                    } else {
+                        // Non-access error — still try other ports, but note it
+                        continue;
+                    }
                 }
-            } catch (e) {
-                console.warn('[DETECT] Could not read config.json, using previous version:', e.message);
             }
-            
-            currentDevice = { type: 'classic', path: classic.path, name: 'Classic Controller' };
+
+            if (!chosen) {
+                // None of the attempts succeeded. Fall back to preferred port but warn the user.
+                chosen = classic;
+                console.warn('[DETECT] No port could be read successfully. Falling back to preferred port:', chosen.path);
+            }
+
+            console.log('[DETECT] ✓ Classic device found:', chosen);
+            console.log('[DETECT] ✓ Will connect to:', chosen.path);
+
+            currentDevice = { type: 'classic', path: chosen.path, name: 'Classic Controller' };
             deviceName.textContent = 'Classic Controller';
             currentFW.textContent = 'Classic firmware';
             hwVersion.textContent = `Hardware: ${hardwareVersion.toUpperCase()}`;
@@ -231,11 +275,18 @@ async function flashFirmware(targetFirmware) {
             }
             
             updateProgress(50, 'Copying firmware...');
-            await window.electronAPI.flashToBootsel(
-                firmwareName,
-                firmwareUrl,
-                currentDevice.path
-            );
+            console.log('[FLASH] Invoking flashToBootsel with', firmwareName, firmwareUrl, currentDevice.path);
+            try {
+                await window.electronAPI.flashToBootsel(
+                    firmwareName,
+                    firmwareUrl,
+                    currentDevice.path
+                );
+                console.log('[FLASH] flashToBootsel resolved');
+            } catch (e) {
+                console.error('[FLASH] flashToBootsel rejected:', e && e.message ? e.message : e);
+                throw e;
+            }
             updateProgress(100, 'Complete!');
             setTimeout(reset, 2000);
             return;
@@ -268,6 +319,16 @@ async function flashFirmware(targetFirmware) {
             }
 
             console.log('[FLASH] Calling Santroller USB reboot...');
+            // Prepare pending flash fallback in case main misses the mount event
+            try {
+                const pendingFirmwareName = `${targetFirmware === 'classic' ? 'Classic' : 'Santroller'}-${versionForFlash}`;
+                const pendingFirmwareUrl = FIRMWARE_URLS[pendingFirmwareName];
+                pendingFlash = { firmwareName: pendingFirmwareName, firmwareUrl: pendingFirmwareUrl };
+                autoFlashActive = false;
+            } catch (e) {
+                console.warn('[FLASH] Could not prepare pendingFlash fallback:', e && e.message ? e.message : e);
+            }
+
             await window.electronAPI.resetSantrollerHID(currentDevice.path);
             
             // After reboot, wait for BOOTSEL and read hardware version before flashing
@@ -275,9 +336,26 @@ async function flashFirmware(targetFirmware) {
             updateProgress(50, 'Waiting for bootloader...');
             
             // Use new API that waits for BOOTSEL, reads version, then flashes
-            await window.electronAPI.startFlashWithVersionDetection(targetFirmware, versionForFlash);
+            console.log('[FLASH] Invoking startFlashWithVersionDetection with', targetFirmware, versionForFlash);
+            try {
+                await window.electronAPI.startFlashWithVersionDetection(targetFirmware, versionForFlash);
+                console.log('[FLASH] startFlashWithVersionDetection resolved');
+            } catch (e) {
+                console.error('[FLASH] startFlashWithVersionDetection rejected:', e && e.message ? e.message : e);
+                throw e;
+            }
         } else if (currentDevice.type === 'classic') {
             console.log('[FLASH] Calling Classic serial reboot...');
+            // Prepare pending flash fallback in case main misses the mount event
+            try {
+                const pendingFirmwareName = `${targetFirmware === 'classic' ? 'Classic' : 'Santroller'}-${versionForFlash}`;
+                const pendingFirmwareUrl = FIRMWARE_URLS[pendingFirmwareName];
+                pendingFlash = { firmwareName: pendingFirmwareName, firmwareUrl: pendingFirmwareUrl };
+                autoFlashActive = false;
+            } catch (e) {
+                console.warn('[FLASH] Could not prepare pendingFlash fallback (classic):', e && e.message ? e.message : e);
+            }
+
             await window.electronAPI.resetClassicSerial(currentDevice.path);
             
             // For Classic, we already know the version, so flash directly
@@ -292,7 +370,14 @@ async function flashFirmware(targetFirmware) {
             console.log('[FLASH] Firmware name:', firmwareName);
             console.log('[FLASH] Firmware URL:', firmwareUrl);
             
-            await window.electronAPI.startFlash(firmwareName, firmwareUrl);
+            console.log('[FLASH] Invoking startFlash (direct classic) with', firmwareName, firmwareUrl);
+            try {
+                await window.electronAPI.startFlash(firmwareName, firmwareUrl);
+                console.log('[FLASH] startFlash (direct classic) resolved');
+            } catch (e) {
+                console.error('[FLASH] startFlash (direct classic) rejected:', e && e.message ? e.message : e);
+                throw e;
+            }
         } else {
             throw new Error(`Unknown device type: ${currentDevice.type}`);
         }

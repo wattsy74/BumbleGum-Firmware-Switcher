@@ -10,16 +10,10 @@
     "build:mac:arm64": "electron-builder --mac --arm64",
     "build:mac:x64": "electron-builder --mac --x64",
     "build:mac:zip": "electron-builder --mac zip",
-    "build:win": "electron-builder --win",
+  "build:win": "electron-builder --win --x64",
     "build:linux": "electron-builder --linux",
     "build:all": "electron-builder --mac --win --linux"
   },
-  "keywords": [
-    "firmware",
-    "flasher",
-    "santroller",
-    "rp2040"
-  ],
   "author": "Martyn Watts",
   "license": "MIT",
   "dependencies": {
@@ -83,8 +77,7 @@
         {
           "target": "nsis",
           "arch": [
-            "x64",
-            "ia32"
+            "x64"
           ]
         },
         {
